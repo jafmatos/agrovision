@@ -1,0 +1,37 @@
+[project]
+name = "deep-learning"
+version = "0.1.0"
+description = "Deep Learning e Visão Computacional"
+readme = "README.md"
+authors = [
+    { name = "José Anselmo", email = "anselmojose297@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch",
+    "torchvision",
+    "amd-torch-device-gfx1102",
+    "amd-torchvision-device-gfx1102",
+    "pillow",
+    "matplotlib",
+    "streamlit",
+    "scikit-learn",
+    "ipykernel",
+]
+
+[project.scripts]
+deep-learning = "deep_learning:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+index-strategy = "unsafe-best-match"
+extra-index-url = ["https://repo.amd.com/rocm/whl-multi-arch/"]
+
+
+
+
+
