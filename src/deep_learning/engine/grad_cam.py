@@ -1,9 +1,11 @@
-from typing import Self
-from typing import Any
-from torch.utils.hooks import RemovableHandle
+from typing import Any, Self
+
+import numpy
 import torch
-from torch import nn
 import torch.nn.functional as F
+from matplotlib import pyplot
+from torch import nn
+from torch.utils.hooks import RemovableHandle
 
 
 class GradCAM:
@@ -44,8 +46,11 @@ class GradCAM:
         self.gradients = grad_output[0]
 
     def generate_heatmap(
-        self, input_tensor: torch.Tensor, target_class: int | None = None
-    ):
+        self,
+        input_tensor: torch.Tensor,
+        target_class: int | None = None,
+        colormap_name: str = "jet",
+    ) -> numpy.ndarray:
         self.model.eval()
 
         logits: torch.Tensor = self.model(input_tensor)
@@ -71,8 +76,27 @@ class GradCAM:
         cam_min = cam.min()
         cam_max = cam.max()
         cam_normalized = (cam - cam_min) / ((cam_max - cam_min) + 1e-8)
+        cam_normalized = cam_normalized.detach()
 
-        return cam_normalized.detach()
+        height, width = list(input_tensor.shape)[-2:]
+
+        heatmap_batch = cam_normalized.unsqueeze(0).unsqueeze(0)
+        heatmap_resized = (
+            F.interpolate(
+                heatmap_batch,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            .squeeze()
+            .cpu()
+            .numpy()
+        )
+
+        cmap = pyplot.get_cmap(colormap_name)
+        colored_cam = cmap(heatmap_resized)[:, :, :3]
+
+        return numpy.uint8(colored_cam * 255)
 
     def remove_hooks(self) -> None:
         for hook in self.hooks:

@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import numpy
 import pandas as pd
 import streamlit as st
@@ -9,13 +7,11 @@ from PIL import Image, ImageOps
 from deep_learning.config import (
     DEVICE,
     IMAGE_SIZE,
-    MOBILENET_MODEL_PATH,
     MODEL_PATH,
-    RESNET_MODEL_PATH,
     TEST_DATA_DIR,
 )
+from deep_learning.engine.grad_cam import GradCAM
 from deep_learning.engine.predictor import predict_single_image, transform
-from deep_learning.models.mobilenet_custom import MobileNetCustom
 from deep_learning.models.resnet_custom import ResNetCustom
 
 # Configurações de validação
@@ -60,24 +56,20 @@ RECOMMENDATIONS = {
 
 
 @st.cache_resource(show_spinner=False)
-def load_trained_model(model_name: str = "ResNet-50"):
-    if model_name == "MobileNetV3-Small":
-        weights_path = MOBILENET_MODEL_PATH
-        model = MobileNetCustom(num_classes=len(CLASSES))
-    else:
-        weights_path = RESNET_MODEL_PATH if RESNET_MODEL_PATH.exists() else MODEL_PATH
-        model = ResNetCustom(num_classes=len(CLASSES))
+def load_trained_model() -> ResNetCustom | None:
+    if not MODEL_PATH.exists():
+        return None
 
-    if not weights_path.exists():
-        return None, weights_path
-
+    model = ResNetCustom(num_classes=len(CLASSES))
     model.switch_head()
-    state_dict = torch.load(weights_path, map_location=DEVICE)
+
+    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+
     model.load_state_dict(state_dict)
     model.to(DEVICE)
     model.eval()
 
-    return model, weights_path
+    return model
 
 
 st.title("Diagnóstico Foliar")
@@ -85,22 +77,18 @@ st.markdown(
     "Envie uma imagem ou selecione uma amostra de teste para análise automatizada."
 )
 
-# Seleção de Modelo na barra lateral
+# Informações do Modelo na barra lateral
 with st.sidebar:
-    st.markdown("#### Arquitetura de Inferência")
-    model_choice = st.selectbox(
-        "Modelo:",
-        options=["ResNet-50", "MobileNetV3-Small"],
-        index=0,
-        help="Alterne entre ResNet-50 (máxima precisão) e MobileNetV3 (leve e rápido).",
-    )
+    st.markdown("#### Modelo de Inferência")
+    st.success("🌱 **ResNet-50**")
+    st.caption("Rede neural convolucional pré-treinada no ImageNet com fine-tuning para patologia foliar.")
 
 # Carregamento do modelo
-model, weights_path = load_trained_model(model_choice)
+model = load_trained_model()
 
 if model is None:
     st.error(
-        f"Arquivo de pesos não encontrado para {model_choice} em `{weights_path}`. "
+        f"Arquivo de pesos não encontrado para o modelo em `{MODEL_PATH}`. "
         "Execute o treinamento primeiro via `src/main.py`."
     )
     st.stop()
@@ -174,7 +162,9 @@ with col_result:
             with st.spinner("Processando diagnóstico..."):
                 # Pré-processamento
                 fitted_image = ImageOps.fit(
-                    selected_image, IMAGE_SIZE, method=Image.Resampling.BILINEAR
+                    selected_image,
+                    IMAGE_SIZE,
+                    method=Image.Resampling.BILINEAR,
                 )
                 image_numpy = numpy.array(fitted_image)
 
@@ -187,10 +177,31 @@ with col_result:
                     transform=transform,
                 )
 
+                # Prepara tensor 4D no formato PyTorch para o Grad-CAM
+                input_tensor = (
+                    torch.from_numpy(
+                        numpy.ascontiguousarray(
+                            image_numpy.astype(numpy.float32).transpose(2, 0, 1) / 255
+                        )
+                    )
+                    .unsqueeze(dim=0)
+                    .to(DEVICE)
+                )
+
+                with GradCAM(model=model, target_layer=model.model.layer4) as grad_cam:
+                    heatmap_array = grad_cam.generate_heatmap(
+                        input_tensor=input_tensor,
+                        target_class=result["predicted_class_index"],
+                    )
+                    heatmap_image = Image.fromarray(heatmap_array)
+
                 st.session_state["last_result"] = {
                     "predicted_class": result["predicted_class"],
+                    "predicted_class_index": result["predicted_class_index"],
                     "certainty": result["certainty"],
                     "probabilities": result["probabilities"],
+                    "fitted_image": fitted_image,
+                    "heatmap_image": heatmap_image,
                 }
 
         # Exibição dos resultados
@@ -228,3 +239,38 @@ with col_result:
             with st.expander("Recomendações Técnicas", expanded=True):
                 for action in rec.get("actions", []):
                     st.markdown(f"- {action}")
+
+            # Auditoria Visual com Grad-CAM ao final da predição
+            if "heatmap_image" in res and "fitted_image" in res:
+                st.markdown("---")
+                st.subheader("Auditoria Visual com Grad-CAM")
+                st.caption(
+                    "O mapa térmico evidencia as regiões da folha que mais influenciaram a rede na tomada de decisão."
+                )
+
+                alpha = st.slider(
+                    "Transparência da Sobreposição (Alpha):",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.5,
+                    step=0.05,
+                    help="0.0 exibe apenas a folha original; 1.0 exibe apenas o mapa térmico de calor.",
+                )
+
+                image_with_heatmap = Image.blend(
+                    res["fitted_image"], res["heatmap_image"], alpha=alpha
+                )
+
+                col_cam1, col_cam2 = st.columns(2)
+                with col_cam1:
+                    st.image(
+                        res["fitted_image"],
+                        caption="Entrada da Rede (224×224)",
+                        width="stretch",
+                    )
+                with col_cam2:
+                    st.image(
+                        image_with_heatmap,
+                        caption=f"Grad-CAM ({pred_cls}) — Alpha: {alpha:.2f}",
+                        width="stretch",
+                    )

@@ -48,4 +48,6 @@
 | **Inferência sem gravar gradientes** | `with torch.no_grad(): logits = modelo(batch)` | Economiza memória de vídeo e tempo de processamento. |
 | **Probabilidades percentuais** | `probs = torch.softmax(logits, dim=1)` | Converte valores brutos em probabilidades que somam 1.0. |
 | **Auditoria Visual (Grad-CAM)** | `with GradCAM(model, layer) as gc: cam = gc.generate_heatmap(x)` | Gera mapa de calor 2D das regiões que ditaram a decisão. |
-| **Compilar para produção sem Python**| `torch.jit.trace(modelo, dummy_input).save("modelo.pt")` | Exporta para TorchScript de alto desempenho e baixa latência. |
+| **Compilar para TorchScript (C++)**| `torch.jit.trace(modelo, dummy).save("modelo.pt")` | Exporta grafo estático serializado sem dependência da classe Python. |
+| **Exportar para ONNX (Universal)** | `torch.onnx.export(m, d, "m.onnx", dynamic_axes={"in": {0: "b"}}, opset_version=17)` | Exporta para padrão aberto com suporte a batch dinâmico. |
+| **Inferência sem PyTorch (ONNX)** | `ort.InferenceSession("m.onnx").run(["logits"], {"in": x_np})` | Executa inferência em C++ usando apenas NumPy (~50 MB runtime). |

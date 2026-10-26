@@ -51,3 +51,4 @@
 | [`exemplo_transfer_learning.py`](exemplo_transfer_learning.py) | O pipeline completo em 2 fases pronto para levar para o `resnet_custom.py`. |
 | [`exemplo_transforms_v2.py`](exemplo_transforms_v2.py) | Comparação do processamento em lote com `transforms.v2` vs o manual do `transforms.py`. |
 | [`exemplo_gradcam.py`](exemplo_gradcam.py) | Demonstração estritamente tipada do Grad-CAM com hooks seguros, context manager e fusão de imagem. |
+| [`exemplo_export_deploy.py`](exemplo_export_deploy.py) | Pipeline completo de compilação para TorchScript, exportação ONNX (batch dinâmico) e validação numérica. |

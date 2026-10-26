@@ -14,7 +14,8 @@ MODEL_PATH = MODELS_DIR / "resnet.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE = 32
-IMAGE_SIZE = models.ResNet50_Weights.DEFAULT.transforms().crop_size[0]
+CROP_SIZE = models.ResNet50_Weights.DEFAULT.transforms().crop_size
+IMAGE_SIZE = (CROP_SIZE[0], CROP_SIZE[0])
 
 LEARNING_RATE_HEAD = 1e-3
 LEARNING_RATE_BACKBONE = 1e-5

@@ -118,4 +118,4 @@ if __name__ == "__main__":
     model = ResNetCustom(num_classes=3)
 
     train_model_transfer_learning(model, save_path=MODELS_DIR / "resnet.pth")
-
+    

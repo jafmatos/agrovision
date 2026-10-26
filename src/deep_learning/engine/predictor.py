@@ -42,6 +42,7 @@ def predict_single_image(
 
     return {
         "predicted_class": classes[higher_prob_index.item()],
+        "predicted_class_index": higher_prob_index.item(),
         "certainty": round(higher_prob.item(), 4),
         "probabilities": probs_dict,
     }

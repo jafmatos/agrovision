@@ -362,34 +362,318 @@ def inferir_imagem(
 
 ---
 
-## 4. Exportação para Produção: ONNX e TorchScript
+## 4. Exportação para Produção: Compilando para TorchScript e ONNX
 
-Quando colocamos redes em ambientes corporativos de alta demanda, executar via Python puro pode introduzir latência devido ao GIL (Global Interpreter Lock). Podemos compilar a rede para formatos otimizados:
-
-### Opção A: TorchScript (Formato Oficial do PyTorch)
-
+No ambiente de desenvolvimento do AgroVision, executamos a rede neural via **PyTorch Eager Mode** através do arquivo `predictor.py`:
 ```python
-modelo.eval()
-amostra_dummy = torch.randn(1, 3, 224, 224)
-
-# Compila o grafo computacional via tracing
-modelo_compilado = torch.jit.trace(modelo, amostra_dummy)
-modelo_compilado.save("modelo_otimizado.pt")
-
-# Pode ser carregado em C++ ou Python sem depender da definição original da classe!
+# Abordagem de desenvolvimento (Eager Mode)
+modelo = carregar_pesos("meu_modelo.pth")
+com torch.no_grad():
+    saida = modelo(tensor)
 ```
 
-### Opção B: ONNX (Open Neural Network Exchange)
+Embora ideal para experimentação iterativa, o deploy em produção dessa forma introduz **gargalos graves de engenharia**:
 
-```python
-torch.onnx.export(
-    modelo,
-    amostra_dummy,
-    "modelo.onnx",
-    input_names=["input"],
-    output_names=["output"],
-    dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}}
-)
+1. **Dependência Forte do Código-Fonte Python:** O arquivo `.pth` salva apenas o `state_dict` (dicionário de tensores com pesos e vieses). Para instanciar o modelo em qualquer microsserviço, a definição exata da classe em Python (`class ResNetCustom(nn.Module)`) precisa estar instalada e acessível no ambiente.
+2. **Imagens Docker Gigantescas e Cold-Starts Lentos:** A imagem base precisa conter a biblioteca PyTorch inteira (~2.5 GB a 5 GB com drivers CUDA), gerando alto consumo de armazenamento e lentidão crítica em escalonamento automático de contêineres (*auto-scaling*).
+3. **Overhead do GIL e Despacho Python:** No CPython, toda operação passa pelo Global Interpreter Lock (GIL) e pela camada de despacho (*dispatch overhead*) do interpretador a cada chamada de camada convolucional, limitando o throughput de requisições simultâneas em CPU.
+
+Para contornar essas limitações, compilamos o modelo para formatos otimizados de grafo estático: **TorchScript** e **ONNX**.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Modelo PyTorch Treinado                         │
+│                           (ResNet / MobileNet)                         │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                  ┌─────────────────┴─────────────────┐
+                  ▼                                   ▼
+┌───────────────────────────────────┐ ┌───────────────────────────────────┐
+│     Opção 1: TorchScript (.pt)    │ │        Opção 2: ONNX (.onnx)      │
+│  • Compilação em C++ (LibTorch)   │ │  • Formato aberto e interoperável │
+│  • Independente de código Python  │ │  • Sem PyTorch em produção        │
+│  • Otimização e fusão de nós      │ │  • Runtime minúsculo (~50 MB)     │
+└─────────────────┬─────────────────┘ └─────────────────┬─────────────────┘
+                  │                                     │
+                  ▼                                     ▼
+┌───────────────────────────────────┐ ┌───────────────────────────────────┐
+│     Deploy em C++, TorchServe     │ │      ONNX Runtime / TensorRT      │
+│      ou Microsserviço Python      │ │      Edge / Web / Servidores      │
+└───────────────────────────────────┘ └───────────────────────────────────┘
 ```
 
-O arquivo `.onnx` pode ser executado em runtimes ultrarrápidos como **ONNX Runtime**, **TensorRT** (NVIDIA) ou compiladores de borda para celulares e microcontroladores.
+---
+
+### 4.1 TorchScript: O Compilador Nativo do PyTorch
+
+O **TorchScript** é uma representação intermediária (*Intermediate Representation* - IR) do PyTorch serializada em arquivo único. Uma vez exportado, o modelo pode ser executado em processos **C++ puros (sem interpretador Python instalado)** ou em Python livre da contenção do GIL.
+
+Existem duas estratégias para gerar um artefato TorchScript:
+
+#### A) Tracing (`torch.jit.trace`) — O Padrão para Redes de Visão Computacional
+Alimenta um tensor arbitrário (*dummy input*) através do modelo e grava a sequência exata de operações executadas pelos tensores.
+* **Vantagens:** Funciona imediatamente com quase todas as arquiteturas convolucionais do TorchVision (ResNet, ConvNeXt, MobileNet, EfficientNet).
+* **Limitação:** Não captura estruturas de controle dependentes de valores dinâmicos dos tensores (ex.: `if tensor.sum() > 0:`). O tracing congela apenas o caminho executado pelo *dummy input*.
+
+#### B) Scripting (`torch.jit.script`) — Para Fluxos Dinâmicos
+Inspeciona diretamente o código-fonte Python e compila a sintaxe para o dialeto TorchScript.
+* **Vantagens:** Preserva condicionais (`if/else`) e laços (`for/while`) dependentes do conteúdo dos tensores.
+* **Limitação:** Exige que todo o código Python siga um subconjunto estrito de tipagem e sintaxe suportado pelo compilador TorchScript.
+
+#### 🛠️ Código Completo de Exportação para TorchScript
+
+> [!IMPORTANT]
+> **Sempre chame `model.eval()` antes da exportação!**  
+> Se o modelo estiver em modo de treino (`model.train()`), camadas de `Dropout` gravarão nós estocásticos aleatórios no grafo e camadas de `BatchNorm` continuarão atualizando estatísticas de média e variância durante o rastreamento, corrompendo a inferência.
+
+```python
+from pathlib import Path
+import torch
+import torch.nn as nn
+from torchvision import models
+
+def exportar_para_torchscript(
+    modelo: nn.Module,
+    caminho_saida: str | Path,
+    tamanho_entrada: tuple[int, int] = (224, 224),
+    device: torch.device = torch.device("cpu"),
+) -> None:
+    """
+    Exporta uma arquitetura PyTorch para grafo estático TorchScript via Tracing.
+
+    Args:
+        modelo: Rede neural com pesos ajustados.
+        caminho_saida: Destino do arquivo compilado (.pt).
+        tamanho_entrada: Resolução espacial da imagem (H, W).
+        device: Dispositivo onde a compilação será executada.
+    """
+    # 1. Trava Dropout e fixa estatísticas de BatchNorm
+    modelo.eval().to(device)
+
+    # 2. Cria tensor dummy representativo com formato [Batch, Canais, Altura, Largura]
+    dummy_input = torch.randn(1, 3, *tamanho_entrada, dtype=torch.float32, device=device)
+
+    # 3. Rastreia o grafo computacional
+    with torch.no_grad():
+        modelo_traced = torch.jit.trace(modelo, dummy_input)
+
+    # 4. Salva o artefato serializado no disco
+    caminho_saida = Path(caminho_saida)
+    caminho_saida.parent.mkdir(parents=True, exist_ok=True)
+    modelo_traced.save(str(caminho_saida))
+    print(f"✅ Modelo TorchScript exportado com sucesso: {caminho_saida}")
+
+
+# Como inferir usando o modelo TorchScript carregado (sem a classe original!):
+def inferir_torchscript(caminho_modelo: str | Path, tensor_entrada: torch.Tensor) -> torch.Tensor:
+    # torch.jit.load não requer importação de ResNetCustom ou resnet_custom.py
+    modelo_carregado = torch.jit.load(str(caminho_modelo))
+    modelo_carregado.eval()
+    with torch.no_grad():
+        logits = modelo_carregado(tensor_entrada)
+    return logits
+```
+
+---
+
+### 4.2 ONNX: O Padrão Aberto Universal da Indústria
+
+O **ONNX (Open Neural Network Exchange)** é um formato aberto baseado em *Protocol Buffers* criado para permitir a portabilidade total de modelos entre frameworks (PyTorch, TensorFlow, Scikit-Learn) e motores de inferência de altíssimo desempenho (**ONNX Runtime**, **NVIDIA TensorRT**, **Intel OpenVINO**, **Apple CoreML**).
+
+#### Por que o ONNX é a escolha predileta para microsserviços?
+* **Adeus Dependência de PyTorch:** Em servidores de produção, o microsserviço (ex.: FastAPI) precisa apenas do pacote `onnxruntime` (~50 MB), descartando os ~3 GB do PyTorch.
+* **Otimização de Grafo Automática:** O runtime aplica fusão de camadas (*Constant Folding*, *Conv+BatchNorm+ReLU fusion*) e vetorização via instruções AVX-512 ou Tensor Cores.
+* **Interoperabilidade Total:** O mesmo arquivo `.onnx` pode ser servido em uma API Linux em nuvem, em um aplicativo mobile iOS/Android ou diretamente no navegador web via WebAssembly/WebGPU.
+
+#### ⚠️ A Armadilha dos Eixos Dinâmicos (`dynamic_axes`)
+
+Ao exportar com `torch.onnx.export`, o PyTorch utiliza a dimensão do `dummy_input` para definir a assinatura do grafo. Se o `dummy_input` for `[1, 3, 224, 224]` e você **não** declarar `dynamic_axes`, o grafo aceitará **exclusivamente imagens unitárias**.
+
+Se um lote de 8 imagens for enviado para o modelo em produção, a aplicação sofrerá um erro crítico irrecuperável:
+```
+RuntimeError: ONNX Runtime failed: Got invalid dimensions for input: expected 1, got 8
+```
+
+Para garantir que a API suporte desde 1 imagem até grandes lotes dinâmicos, definimos o eixo 0 como `batch_size`.
+
+#### 🛠️ Código Completo de Exportação para ONNX
+
+> [!NOTE]
+> **Pré-requisito para exportação no PyTorch:**  
+> O PyTorch utiliza a biblioteca `onnx` para gerar e validar o arquivo de protocolo de grafo. No ambiente de desenvolvimento, instale com:  
+> `uv add onnx` (ou `pip install onnx`).  
+> Já no servidor final de deploy, apenas `onnxruntime` será necessário.
+
+```python
+from pathlib import Path
+import torch
+import torch.nn as nn
+
+def exportar_para_onnx(
+    modelo: nn.Module,
+    caminho_saida: str | Path,
+    tamanho_entrada: tuple[int, int] = (224, 224),
+    opset_version: int = 17,
+) -> None:
+    """
+    Exporta uma arquitetura PyTorch para o formato interoperável ONNX com dimensões dinâmicas.
+
+    Args:
+        modelo: Rede neural com pesos ajustados.
+        caminho_saida: Destino do arquivo exportado (.onnx).
+        tamanho_entrada: Resolução espacial (H, W).
+        opset_version: Versão do conjunto de operadores ONNX (17+ recomendado).
+    """
+    modelo.eval().to("cpu")
+    dummy_input = torch.randn(1, 3, *tamanho_entrada, dtype=torch.float32, device="cpu")
+
+    caminho_saida = Path(caminho_saida)
+    caminho_saida.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.onnx.export(
+        model=modelo,
+        args=dummy_input,
+        f=str(caminho_saida),
+        export_params=True,             # Serializa os pesos treinados dentro do próprio arquivo
+        opset_version=opset_version,     # Versão dos operadores matemáticos
+        do_constant_folding=True,        # Pré-computa constantes em tempo de compilação
+        input_names=["input"],           # Nome da porta de entrada do grafo
+        output_names=["logits"],         # Nome da porta de saída do grafo
+        dynamic_axes={
+            "input": {0: "batch_size"},   # Permite variação dinâmica no tamanho do batch
+            "logits": {0: "batch_size"},  # Saída escala proporcionalmente ao batch
+        },
+    )
+    print(f"✅ Modelo ONNX exportado com sucesso: {caminho_saida}")
+```
+
+---
+
+### 4.3 Servindo em Produção com ONNX Runtime (Zero Dependência de PyTorch)
+
+Em um ambiente enxuto de deploy (ex.: Docker mínimo para nuvem), não instalamos PyTorch. Apenas:
+
+```bash
+pip install onnxruntime        # Para inferência ultrarrápida em CPU
+# ou
+pip install onnxruntime-gpu    # Para inferência acelerada em GPU NVIDIA (CUDA / TensorRT)
+```
+
+O pipeline de inferência torna-se 100% desacoplado e opera puramente com matrizes NumPy:
+
+```python
+from pathlib import Path
+import numpy as np
+import onnxruntime as ort
+from PIL import Image
+
+class PredictorONNX:
+    """
+    Servidor de inferência independente executado via ONNX Runtime.
+    Não requer a instalação do framework PyTorch no ambiente de produção.
+    """
+    def __init__(self, caminho_onnx: str | Path, provider: str = "CPUExecutionProvider") -> None:
+        self.session = ort.InferenceSession(str(caminho_onnx), providers=[provider])
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+
+    def preprocess(self, imagem_pil: Image.Image, size: tuple[int, int] = (224, 224)) -> np.ndarray:
+        """
+        Pré-processamento idêntico ao torchvision.transforms sem importar PyTorch:
+        1. Redimensionamento
+        2. Normalização Z-score com estatísticas do ImageNet
+        3. Transposição para formato NCHW [1, 3, H, W] em float32
+        """
+        img = imagem_pil.convert("RGB").resize(size, Image.Resampling.BILINEAR)
+        img_np = np.array(img, dtype=np.float32) / 255.0  # [H, W, C] em [0.0, 1.0]
+
+        # Estatísticas ImageNet
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img_norm = (img_np - mean) / std
+
+        # Transpõe [H, W, C] -> [C, H, W] e adiciona dimensão de Batch [1, C, H, W]
+        img_nchw = np.transpose(img_norm, (2, 0, 1))
+        return np.expand_dims(img_nchw, axis=0)
+
+    def prever(self, imagem_pil: Image.Image) -> tuple[int, float]:
+        """
+        Executa a inferência e retorna (índice da classe, probabilidade percentual).
+        """
+        tensor_np = self.preprocess(imagem_pil)
+        
+        # Execução direta no motor C++ do ONNX Runtime
+        saidas = self.session.run([self.output_name], {self.input_name: tensor_np})
+        logits = saidas[0][0]  # shape: [num_classes]
+
+        # Softmax manual em NumPy: e^(x - max) / sum(e^(x - max))
+        exp_logits = np.exp(logits - np.max(logits))
+        probabilidades = exp_logits / np.sum(exp_logits)
+        
+        idx_vencedor = int(np.argmax(probabilidades))
+        confianca = float(probabilidades[idx_vencedor] * 100.0)
+
+        return idx_vencedor, confianca
+```
+
+---
+
+### 4.4 Validação e Paridade Numérica
+
+Antes de promover um modelo exportado para produção, é mandatório realizar o teste de **equivalência matemática**. O objetivo é comprovar que a discrepância entre a saída do PyTorch original e a saída do compilador otimizado é desprezível (erros de truncamento de ponto flutuante $\le 10^{-5}$).
+
+```python
+import numpy as np
+import torch
+import onnxruntime as ort
+
+def validar_equivalencia_numerica(
+    modelo_pytorch: torch.nn.Module,
+    caminho_onnx: str,
+    tolerancia_absoluta: float = 1e-5,
+) -> bool:
+    """
+    Comprova que o modelo ONNX gera predições estritamente idênticas ao PyTorch original.
+    """
+    modelo_pytorch.eval()
+    amostra = torch.randn(2, 3, 224, 224, dtype=torch.float32)
+
+    # 1. Saída de referência no PyTorch
+    with torch.no_grad():
+        saida_pytorch = modelo_pytorch(amostra).cpu().numpy()
+
+    # 2. Saída no ONNX Runtime
+    session = ort.InferenceSession(caminho_onnx, providers=["CPUExecutionProvider"])
+    nome_entrada = session.get_inputs()[0].name
+    nome_saida = session.get_outputs()[0].name
+    saida_onnx = session.run([nome_saida], {nome_entrada: amostra.numpy()})[0]
+
+    # 3. Diferença absoluta máxima entre os dois grafos
+    diferenca_maxima = np.max(np.abs(saida_pytorch - saida_onnx))
+    print(f"📊 Diferença máxima absoluta: {diferenca_maxima:.8f}")
+
+    # 4. Asserção matemática formal
+    np.testing.assert_allclose(
+        saida_pytorch,
+        saida_onnx,
+        rtol=1e-3,
+        atol=tolerancia_absoluta,
+        err_msg="Divergência numérica detectada entre PyTorch e ONNX!",
+    )
+    print("✅ Validação concluída: O modelo exportado possui 100% de fidelidade numérica.")
+    return True
+```
+
+---
+
+### 4.5 Matriz de Decisão de Deploy: Qual Formato Escolher?
+
+| Critério | PyTorch Eager (`.pth`) | TorchScript (`.pt`) | ONNX (`.onnx`) |
+| :--- | :--- | :--- | :--- |
+| **Principal Caso de Uso** | Pesquisa e Treinamento iterativo. | Produção corporativa focada no ecossistema PyTorch/C++. | Produção multiplataforma, Microsserviços e Borda. |
+| **Dependência de PyTorch** | Obrigatória (pesada, ~3 GB). | Obrigatória em Python / LibTorch em C++. | **Nenhuma**. Requer apenas `onnxruntime` (~50 MB). |
+| **Requer Código Python Original?** | **Sim** (precisa importar a classe). | **Não** (grafo auto-contido). | **Não** (especificação de nós aberta). |
+| **Aceleração de Hardware** | CUDA / ROCm. | CUDA / LibTorch C++ / Vulkan. | TensorRT, OpenVINO, DirectML, CoreML, CUDA. |
+| **Suporte a Controle Dinâmico** | Nativo (sintaxe Python livre). | Suportado apenas com `torch.jit.script`. | Limitado (operações de grafo estático). |
+| **Recomendação no AgroVision** | Ambiente de desenvolvimento. | Microsserviços baseados em C++ / TorchServe. | **API FastAPI de produção e Web/Mobile.** |
+
